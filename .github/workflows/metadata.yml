@@ -1,0 +1,299 @@
+name: metadata
+
+# Port of the `test` stage jobs from the original .gitlab-ci.yml that operate
+# on changed app metadata:
+#   checkupdates, git redirect, fdroid lint, fdroid rewritemeta,
+#   schema validation, check source code
+#
+# GitLab ran these as independent jobs triggered by the
+# `app_verification_rules` ruleset (merge requests + the default branch +
+# pushes to non-default branches, gated on changes to metadata/** and
+# srclibs/**).  Here they are one workflow with path filters.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'metadata/**'
+      - 'srclibs/**'
+  pull_request:
+    paths:
+      - 'metadata/**'
+      - 'srclibs/**'
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref, like GitLab's auto-cancel of
+# redundant pipelines.
+concurrency:
+  group: metadata-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  pip: pip3 --timeout 100 --retries 10
+  # The original pipeline needed a lot of git history because it compares the
+  # merge request against the current master.
+  GIT_DEPTH: '5000'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # checkupdates
+  # -------------------------------------------------------------------------
+  checkupdates:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5000
+          # we must be able to diff against the base branch / target ref
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prerequisites (deb)
+        shell: bash
+        run: |
+          set -eux
+          apt-get --allow-releaseinfo-change update
+          apt-get -qy dist-upgrade
+          echo "locales locales/locales_to_be_generated multiselect en_US.UTF-8 UTF-8" | debconf-set-selections
+          apt-get install -qy --no-install-recommends fdroidserver apksigner mercurial git git-svn brz python3-launchpadlib locales curl
+
+      - name: Install fdroidserver (source)
+        uses: ./.github/actions/setup-fdroidserver
+
+      - name: Run fdroid checkupdates on changed builds
+        shell: bash
+        run: |
+          set -xe
+          # shellcheck disable=SC1091
+          source .github/scripts/ci-helpers.sh
+          chown -R "$(whoami)" .
+          get_changed_builds
+          if [ -n "$CHANGED" ]; then
+            fdroid checkupdates --auto -v $CHANGED
+            git --no-pager diff --color=always --exit-code
+          fi
+
+  # -------------------------------------------------------------------------
+  # git redirect
+  # -------------------------------------------------------------------------
+  git-redirect:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5000
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eux
+          apt-get -qy update
+          apt-get -qy dist-upgrade
+          apt-get -qy install --no-install-recommends ca-certificates git python3 python3-yaml
+
+      - name: Check for git redirects
+        shell: bash
+        run: |
+          set -eux
+          # shellcheck disable=SC1091
+          source .github/scripts/ci-helpers.sh
+          chown -R "$(whoami)" .
+          get_changed_apps
+          test -n "$CHANGED" || exit 0
+          tools/rewrite-git-redirects.py $CHANGED
+          git --no-pager diff --color=always --exit-code || {
+                printf "\x1b[31mERROR git URLs should be direct, not redirects!\x1b[0m\n";
+                exit 1;
+            }
+
+      - name: Upload codequality report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codequality-git-redirect
+          path: codequality.json
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # fdroid lint
+  # -------------------------------------------------------------------------
+  fdroid-lint:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5000
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prerequisites (deb)
+        shell: bash
+        run: |
+          set -eux
+          apt-get --allow-releaseinfo-change update
+          apt-get -qy dist-upgrade
+          echo "locales locales/locales_to_be_generated multiselect en_US.UTF-8 UTF-8" | debconf-set-selections
+          apt-get install -qy --no-install-recommends fdroidserver apksigner mercurial git git-svn brz python3-launchpadlib locales curl
+
+      - name: Install fdroidserver (source)
+        uses: ./.github/actions/setup-fdroidserver
+
+      - name: fdroid lint
+        shell: bash
+        run: |
+          set -eux
+          # shellcheck disable=SC1091
+          source .github/scripts/ci-helpers.sh
+          chown -R "$(whoami)" .
+          get_changed_apps
+          test -n "$CHANGED" || exit 0
+          echo $CHANGED
+          fdroid lint $CHANGED
+
+  # -------------------------------------------------------------------------
+  # fdroid rewritemeta
+  # -------------------------------------------------------------------------
+  fdroid-rewritemeta:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5000
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prerequisites (deb)
+        shell: bash
+        run: |
+          set -eux
+          apt-get --allow-releaseinfo-change update
+          apt-get -qy dist-upgrade
+          echo "locales locales/locales_to_be_generated multiselect en_US.UTF-8 UTF-8" | debconf-set-selections
+          apt-get install -qy --no-install-recommends fdroidserver apksigner mercurial git git-svn brz python3-launchpadlib locales curl
+
+      - name: Install fdroidserver (source)
+        uses: ./.github/actions/setup-fdroidserver
+
+      - name: fdroid rewritemeta
+        shell: bash
+        run: |
+          set -eux
+          # shellcheck disable=SC1091
+          source .github/scripts/ci-helpers.sh
+          chown -R "$(whoami)" .
+          get_changed_apps
+          if [ -n "$CHANGED" ]; then
+              fdroid rewritemeta $CHANGED;
+              git diff --exit-code > /dev/null || {
+                  printf "\nThese files need rewritemeta:\n";
+                  git diff --name-only;
+                  printf "\nThese are the formatting issues:\n";
+                  printf "$(git --no-pager diff --color=always --ws-error-highlight=all | sed -e 's/\r/^M/' -e 's/%/%%/g')";
+                  mkdir -p tmp
+                  for f in $(git diff --name-only); do cp $f tmp; done
+                  exit 1
+              }
+          fi
+
+      - name: Upload reformatted files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rewritemeta-tmp
+          path: tmp/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # schema validation
+  # -------------------------------------------------------------------------
+  schema-validation:
+    runs-on: ubuntu-latest
+    container:
+      image: python:3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5000
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install check-jsonschema
+        shell: bash
+        run: pip install check-jsonschema
+
+      - name: Validate metadata against schema
+        shell: bash
+        run: |
+          set -eux
+          # shellcheck disable=SC1091
+          source .github/scripts/ci-helpers.sh
+          chown -R "$(whoami)" . || true
+          check-jsonschema --check-metaschema schemas/metadata.json || exit 1
+          resolve_refs
+          if ! git diff --exit-code --name-only "${TARGET_REF}...${SOURCE_REF}" schemas/metadata.json; then
+            # schema itself changed -> validate everything
+            check-jsonschema --schemafile schemas/metadata.json metadata/*.yml || exit 1
+            exit 0
+          fi
+          set -xe
+          get_changed_apps
+          if [ -z "$CHANGED" ]; then exit 0; fi
+          echo $CHANGED | sed -En 's|([^ ]*)|metadata/\1.yml|gp' | xargs check-jsonschema --schemafile schemas/metadata.json
+
+  # -------------------------------------------------------------------------
+  # check source code
+  # -------------------------------------------------------------------------
+  check-source-code:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5000
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prerequisites (deb)
+        shell: bash
+        run: |
+          set -eux
+          apt-get --allow-releaseinfo-change update
+          apt-get -qy dist-upgrade
+          echo "locales locales/locales_to_be_generated multiselect en_US.UTF-8 UTF-8" | debconf-set-selections
+          apt-get install -qy --no-install-recommends fdroidserver apksigner mercurial git git-svn brz python3-launchpadlib locales curl
+
+      - name: Install fdroidserver (source)
+        uses: ./.github/actions/setup-fdroidserver
+
+      - name: Extra dependencies
+        shell: bash
+        run: apt-get install -qy --no-install-recommends python3-markdown-it
+
+      - name: check-fastlane
+        shell: bash
+        run: |
+          set -xe
+          # shellcheck disable=SC1091
+          source .github/scripts/ci-helpers.sh
+          chown -R "$(whoami)" .
+          get_changed_builds
+          if [ -n "$CHANGED" ]; then
+            ./tools/check-fastlane.py $CHANGED > codequality.json
+          fi
+
+      - name: Upload codequality report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codequality-check-source-code
+          path: codequality.json
+          if-no-files-found: ignore

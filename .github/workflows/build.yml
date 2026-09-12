@@ -1,0 +1,365 @@
+name: build
+
+# Port of the `build` stage jobs from the original .gitlab-ci.yml:
+#   fdroid build, check apk
+#
+# IMPORTANT differences from GitLab, documented so the port stays honest:
+#
+#  * The original used the F-Droid buildserver image
+#      registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie
+#    on a `saas-linux-medium-amd64` runner, with a `vagrant` user, sudo-based
+#    sandboxing, `/opt/android-sdk`, ndk, etc.  That image and its
+#    provisioning (https://gitlab.com/fdroid/fdroid-bootstrap-buildserver)
+#    are published on GitLab's registry and assume a specific host layout.
+#    The image is used here unchanged, since it is publicly pullable, but any
+#    environment-specific assumptions ($home_vagrant, sysctl, sudo vagrant)
+#    are guarded so the job fails loudly rather than silently misbehaving.
+#
+#  * Artifacts and codequality reports are published through the
+#    upload-artifact action / the GitHub code-scanning surfaces instead of
+#    GitLab's `artifacts:reports:codequality`.
+#
+#  * The cache is keyed per-job like GitLab's `key: "$CI_JOB_NAME"`.
+
+on:
+  pull_request:
+    paths:
+      - 'metadata/**'
+      - 'srclibs/**'
+  push:
+    branches: ['**']
+    paths:
+      - 'metadata/**'
+      - 'srclibs/**'
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Some env vars are set up in
+  # https://gitlab.com/fdroid/fdroidserver/-/blob/master/buildserver/setup-env-vars
+  home_vagrant: /home/vagrant
+  ANDROID_HOME: /opt/android-sdk
+
+jobs:
+  fdroid-build:
+    runs-on: ubuntu-latest
+    # This image is the F-Droid buildserver, created with the same provisioning
+    # as production via the "docker" job in fdroid/fdroidserver.
+    container:
+      image: registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5000
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Restore gradle cache
+        uses: actions/cache@v4
+        with:
+          path: .gradle
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-
+
+      - name: Prepare build environment
+        shell: bash
+        run: |
+          set -eux
+          # shellcheck disable=SC1091
+          source .github/scripts/ci-helpers.sh
+          chown -R "$(whoami)" .
+          test -d build || mkdir build
+          get_changed_builds
+          test -n "$(printf "%s" "$CHANGED" | tr -d '[:space:]')" \
+                || { echo "no packages need processing, exiting"; exit 0; }
+
+          apt-get update
+          apt-get dist-upgrade -y
+
+          # shellcheck disable=SC1091
+          test -n "$fdroidserver" || source /etc/profile.d/bsenv.sh
+
+          # These packages are needed to make this env like the production buildserver.
+          sdkmanager "platform-tools" "build-tools;31.0.0"
+
+      - name: Install fdroidserver (source)
+        uses: ./.github/actions/setup-fdroidserver
+        with:
+          directory: "${{ github.workspace }}/fdroidserver"
+
+      - name: Run fdroid build
+        shell: bash
+        run: |
+          set -eux
+          # shellcheck disable=SC1091
+          source .github/scripts/ci-helpers.sh
+          get_changed_builds
+
+          git -C "$home_vagrant/gradlew-fdroid" pull
+
+          export CODEQUALITY_DIR=$HOME/codequality
+          mkdir -p "$CODEQUALITY_DIR"
+
+          # Set up git config something like the production buildserver.
+          curl --silent 'https://gitlab.com/fdroid/fdroid-bootstrap-buildserver/-/raw/master/roles/production_hardening/files/gitconfig' >> "$GITHUB_WORKSPACE/../.gitconfig"
+
+          for d in logs tmp unsigned "$home_vagrant/.android" "$home_vagrant/.gradle" "$home_vagrant/metadata"; do
+              test -d "$d" || mkdir -p "$d";
+              chown -R vagrant "$d";
+          done
+          # make sure .gradle stores inside the workspace to make it cacheable
+          ln -s "$home_vagrant/.gradle" "$GITHUB_WORKSPACE/.gradle"
+          ln -s "$GITHUB_WORKSPACE/tmp" "$home_vagrant/tmp"
+          ln -s "$GITHUB_WORKSPACE/srclibs" "$home_vagrant/srclibs"
+
+          # Some builds need to track a lot of files, so this needs to be set
+          # for them to succeed.  Some runners do not support setting sysctl,
+          # so it cannot be required.
+          sysctl fs.inotify.max_user_watches=524288 || true
+
+          export GRADLE_USER_HOME="$home_vagrant/.gradle"
+          # each `fdroid build --on-server` run expects sudo, then uninstalls it
+          export fdroid="sudo --preserve-env --user vagrant \
+                env PATH=$fdroidserver:$PATH \
+                env PYTHONPATH=$fdroidserver:$fdroidserver/examples \
+                env PYTHONUNBUFFERED=true \
+                env TERM=$TERM \
+                env HOME=$home_vagrant \
+                fdroid"
+
+          # use fdroidserver test keystore as placeholder since `fdroid publish` requires it
+          export keystorepass='r9aquRHYoI8+dYz6jKrLntQ5/NJNASFBacJh7Jv2BlI='
+          export keypass='r9aquRHYoI8+dYz6jKrLntQ5/NJNASFBacJh7Jv2BlI='
+          export keystore="$fdroidserver/tests/keystore.jks"
+          keytool -changealias -alias sova -destalias ciarang \
+              -keystore "$keystore" -storepass:env keystorepass -keypass:env keypass
+
+          APPS="$(./tools/find-changed-builds.py)"
+          if [ -z "$APPS" ]; then exit 0; fi
+
+          for build in $APPS; do
+              set -x;
+              apt-get install -y sudo;
+              apt-get install -y openjdk-21-jdk-headless;
+              update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java;
+              cp -R "$GITHUB_WORKSPACE/build" "$home_vagrant/build";
+              appid=${build%:*};
+              [ -d "metadata/$appid" ] && cp -R "metadata/$appid" "$home_vagrant/metadata";
+              cp -R "metadata/$appid.yml" "$home_vagrant/metadata";
+              chown -R vagrant "$home_vagrant" "$GITHUB_WORKSPACE";
+              pushd "$home_vagrant";
+              ln -s "$GITHUB_WORKSPACE" "$home_vagrant/fdroiddata";
+              ln -s "$GITHUB_WORKSPACE/../.gitconfig" "$home_vagrant/.gitconfig";
+              $fdroid fetchsrclibs $build --verbose;
+              rm "$home_vagrant/fdroiddata" "$home_vagrant/.gitconfig";
+              (unset CI; $fdroid build --verbose --test --refresh-scanner --on-server --no-tarball $build);
+              apt-get install -y sudo;
+              popd;
+              vercode=${build#*:};
+              location=$(($(grep -n "^    versionCode: $vercode$" "metadata/$appid.yml" | cut -f1 -d:) - 1));
+              for file in "${appid}_${vercode}.apk"; do
+                if [[ -e "$GITHUB_WORKSPACE/tmp/$file" ]]; then
+                  binary="binaries/${appid}_${vercode}.binary.apk"
+                  signed="signed/${appid}_${vercode}.signed.apk"
+                  # NOTE: the description used to link to the GitLab job artifact
+                  # URL.  On GitHub we link to the run's artifacts page instead.
+                  artifacts_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+                  if [[ -e "$GITHUB_WORKSPACE/tmp/$binary" ]]; then
+                    echo '[{"location":{"path":"metadata/'$appid'.yml","lines":{"begin":'$location'}},"description":"Reproducible build APK: '$artifacts_url' (tmp/'$binary')","check_name":"built_apk","fingerprint":"'$binary'","severity":"info"}]' > "$CODEQUALITY_DIR/${binary#*/}.json";
+                  else
+                    mkdir -p "$GITHUB_WORKSPACE/tmp/signed"
+                    KEYSTORE=$(mktemp -d)/keystore.jks
+                    PASS=111111
+                    echo -e "$PASS\n$PASS\ny\ny\ny\ny\ny\ny\ny" | keytool -genkey -keyalg RSA -keystore "$KEYSTORE" -keysize 2048 2> /dev/null
+                    echo $PASS | apksigner sign --ks "$KEYSTORE" --in "$GITHUB_WORKSPACE/tmp/$file" --out "$GITHUB_WORKSPACE/tmp/$signed"
+                    echo '[{"location":{"path":"metadata/'$appid'.yml","lines":{"begin":'$location'}},"description":"Signed APK: '$artifacts_url' (tmp/'$signed')","check_name":"built_apk","fingerprint":"'$signed'","severity":"info"}]' > "$CODEQUALITY_DIR/${signed#*/}.json";
+                  fi
+                fi
+              done;
+              rm -rf "$home_vagrant/build" || true;
+              rm -rf "$ANDROID_HOME/ndk" || true;
+              ./tools/build-contains-signatures.py $build || continue;
+              $fdroid publish --verbose --error-on-failed $build;
+          done
+
+          ./tools/audit-gradle.py $CHANGED;
+
+          apt-get install -y jq
+          jq '[.[]|.[]]' --slurp "$CODEQUALITY_DIR"/*.json > codequality.json || echo '[]' > codequality.json
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdroid-build
+          path: |
+            repo/
+            unsigned/
+            tmp/
+            codequality.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  check-apk:
+    needs: fdroid-build
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+      options: --privileged
+    env:
+      ANDROID_HOME: /opt/android-sdk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5000
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: fdroid-build
+          path: .
+
+      - name: Bail out if there are no APKs
+        id: check
+        shell: bash
+        run: |
+          if ! compgen -G 'tmp/*.apk' > /dev/null; then
+            echo "no APKs to check, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -qy --no-install-recommends fdroidserver curl unzip zip jq androguard
+
+      - name: Install fdroidserver (source)
+        if: steps.check.outputs.skip == 'false'
+        uses: ./.github/actions/setup-fdroidserver
+
+      - name: Check APKs
+        if: steps.check.outputs.skip == 'false'
+        id: checkapk
+        shell: bash
+        run: |
+          set -o pipefail
+          set -eux
+          chown -R "$(whoami)" .
+          export EXITVALUE=0
+          # shellcheck disable=SC2317
+          function generate_report() {
+            echo '{"location": {
+              "path": "metadata/'$1'.yml",
+              "lines": {"begin": '$2'}},
+              "description": "'$3'",
+              "check_name": "'$4'",
+              "fingerprint": "'$5'",
+              "severity": "'$6'"},'
+          }
+          echo '[' > codequality.json
+          for apk in tmp/*.apk; do
+            appid=$(echo $apk | sed -n 's|tmp/\(.*\)_[0-9]\+\.apk$|\1|p');
+            vercode=$(echo $apk | sed -n 's|tmp/.*_\([0-9]\+\)\.apk$|\1|p');
+            location=$(($(grep -n "^    versionCode: $vercode$" metadata/$appid.yml | cut -f1 -d:) - 1));
+            binary=$(echo $apk | sed -e 's|tmp/|tmp/binaries/|' -e 's/\.apk$/.binary.apk/');
+            if [[ -e $binary ]]; then
+              file=$binary;
+            else
+              file=$apk;
+            fi
+
+            # binary scanner
+            fdroid scanner --verbose --exit-code $file 2>&1 | tee result || {
+              export EXITVALUE=1;
+              for class in $(sed -n "s/.*DEBUG: Problem: found class '\(.*\)'/\1/p" result); do
+                printf "\x1b[31mERROR Found $class in $file\x1b[0m\n";
+                generate_report $appid $location "Found class $class" "class" "$file $class" "critical" >> codequality.json;
+              done
+              grep 'Dependency metadata' result && {
+                printf "\x1b[31mERROR Found extra signing block 'Dependency metadata' in $file\x1b[0m\n";
+                generate_report $appid $location "Found Dependency metadata" "signing_block" "$file Dependency metadata" "minor" >> codequality.json;
+              } || true;
+            } || true;
+
+            # manifest
+            androguard axml $file -o AndroidManifest.xml
+            for permission in $(sed 's/>/>\n/g' AndroidManifest.xml | sed -n 's|.*<uses-permission\S* android:name="\([^"]\+\)".*|\1|p'); do
+                generate_report $appid $location "Permission $permission" "permission" "$file $permission" "info" >> codequality.json;
+            done
+            grep 'android:usesCleartextTraffic="true"' AndroidManifest.xml && \
+              generate_report $appid $location "Cleartext Traffic Permitted" "application_attribution" "$file cleartextTrafficPermitted" "major" >> codequality.json || true;
+            grep 'android:debuggable="true"' AndroidManifest.xml && \
+              generate_report $appid $location "Debuggable APK" "application_attribution" "$file debuggable" "critical" >> codequality.json || true;
+            grep 'android:testOnly="true"' AndroidManifest.xml && \
+              generate_report $appid $location "Testing APK" "application_attribution" "$file testOnly" "critical" >> codequality.json || true;
+
+            # signing key
+            if [[ -e $binary ]]; then
+              dn=$(apksigner verify --print-certs $binary | sed -n -E 's/.*certificate DN: (.*)/\1/p')
+              if [[ $dn = "C=US, O=Android, CN=Android Debug" ]]; then
+                severity="critical"
+                export EXITVALUE=1;
+              else
+                severity="info"
+              fi
+              generate_report $appid $location "Signing Key: $(printf "%s" "$dn" | jq -Rr '@json[1:-1]')" "signing_key" "$file Signing Key" $severity >> codequality.json;
+            fi
+
+            # size and abi
+            size=$(ls -lh $apk | tr -s ' ' | cut -d ' ' -f 5);
+            tempd=$(mktemp -d);
+            unzip -q $apk -d $tempd;
+            if [[ -e $tempd/lib/ ]]; then
+              abis=$(ls "$tempd/lib/");
+                if [[ $(ls $tempd/lib/ | wc -l) -gt 1 ]]; then
+                  abilist="";
+                  filehashlist="";
+                  filenamelist="";
+                  for abi in $abis; do
+                    cp -R $tempd extracted;
+                    for other in $abis; do
+                      if [ $other != $abi ]; then
+                          rm -rf extracted/lib/$other;
+                      fi
+                    done
+                    zip -rq $abi.apk extracted;
+                    abilist+="$abi ($(ls -lh $abi.apk | tr -s ' ' | cut -d ' ' -f 5)) ";
+                    filehashlist+="$(ls $tempd/lib/$abi | sort | md5sum)\n"
+                    filenamelist+="$abi ($(ls -m $tempd/lib/$abi)) "
+                    rm -rf extracted $abi.apk
+                  done
+                  generate_report $appid $location "APK ABI and size: $abilist, $size" "abi_size" "$file ABI and size" "info" >> codequality.json;
+                  if [[ $(echo -e $filehashlist | uniq | wc -l) != 2 ]]; then
+                    generate_report $appid $location "APK has different libs in different ABI: $filenamelist" "abi_diff" "$file ABI diff" "major" >> codequality.json;
+                  fi
+                else
+                  generate_report $appid $location "APK ABI and size: $abis, $size" "abi_size" "$file ABI and size" "info" >> codequality.json;
+                fi
+            else
+              generate_report $appid $location "APK ABI and size: No native lib, $size" "abi_size" "$file ABI and size" "info" >> codequality.json;
+            fi
+          done
+          sed -i -e '$s/,$/]/' codequality.json
+          echo "EXITVALUE=$EXITVALUE" >> "$GITHUB_OUTPUT"
+          exit $EXITVALUE
+
+      - name: Upload codequality report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codequality-check-apk
+          path: codequality.json
+          if-no-files-found: ignore

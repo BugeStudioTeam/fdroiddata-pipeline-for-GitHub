@@ -1,0 +1,232 @@
+name: repository
+
+# Port of the repository/asset-integrity jobs from the original .gitlab-ci.yml:
+#   strip EXIF, repo/index.html, weblate merge conflict,
+#   check_git_repos, checkupdates_filter
+#
+# These run on a broad set of triggers because they guard against different
+# kinds of breakage (image EXIF, link rot, translation merge conflicts, dead
+# git repos, and out-of-policy checkupdates-bot commits).
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  schedule:
+    # GitLab ran check_git_repos on scheduled pipelines.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      check_git_repo:
+        description: 'Run the (slow) git repo availability check'
+        type: boolean
+        default: false
+
+concurrency:
+  group: repository-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # strip EXIF
+  #
+  # GitLab gated this on changed image files via a long case-variant path
+  # list; here an equivalent paths filter plus a find over the whole tree.
+  # -------------------------------------------------------------------------
+  strip-exif:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eux
+          apt-get -qy update
+          apt-get -qy dist-upgrade
+          apt-get -qy install --no-install-recommends exiftool git
+
+      - name: Strip EXIF from images and fail if changed
+        shell: bash
+        run: |
+          set -eux
+          chown -R "$(whoami)" .
+
+          # JPEG
+          find . -type f -iname "*.jpg" -o -iname "*.jpeg" -exec chmod a-x {} \;
+          find . -type f -iname "*.jpg" -o -iname "*.jpeg" -exec exiftool -quiet -all= {} \;
+
+          # PNG
+          find . -type f -iname "*.png" -exec chmod a-x {} \;
+          find . -type f -iname "*.png" -exec exiftool -quiet -all= {} \;
+
+          git diff --exit-code --color || {
+              printf "\x1b[31mERROR Image files (JPEG, PNG) should be stripped and not be set executable:\x1b[0m\n";
+              echo "Try using exiftool, jpegoptim, optipng (e.g. \`exiftool -all= foo.png\`).";
+              echo "For more info, see:";
+              echo "https://umbrella.cisco.com/blog/picture-perfect-how-jpg-exif-data-hides-malware";
+              echo "https://beinset.medium.com/exif-metadata-a-hidden-door-to-cyber-vulnerabilities-52b0dd2ff4de";
+              exit 1;
+            }
+
+  # -------------------------------------------------------------------------
+  # repo/index.html
+  # -------------------------------------------------------------------------
+  repo-index-html:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eux
+          apt-get -qy update
+          apt-get -qy install --no-install-recommends linkchecker tidy
+
+      - name: Check repo/index.html
+        shell: bash
+        run: |
+          set -eux
+          export EXITVALUE=0
+          # shellcheck disable=SC2317
+          function set_error() { export EXITVALUE=1; printf "\x1b[31mERROR %s\x1b[0m\n" "$(history | tail -2 | head -1 | cut -b 6-500)"; }
+          # include fake APK for linkchecker
+          for f in $(grep -Eo '[^"]+/org\.fdroid\.fdroid_[0-9]+\.apk' repo/index.html | sort -u); do
+              (cd repo; mkdir -p "$(dirname $f)"; touch "$f" "${f}.asc");
+          done
+          linkchecker repo/index.html || set_error
+          tidy repo/index.html || set_error
+          exit $EXITVALUE
+
+  # -------------------------------------------------------------------------
+  # weblate merge conflict
+  # -------------------------------------------------------------------------
+  weblate-merge-conflict:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eux
+          apt-get update
+          apt-get -qy upgrade
+          apt-get -qy install --no-install-recommends ca-certificates git
+
+      - name: Check for merge conflicts with Weblate
+        shell: bash
+        run: |
+          set -eux
+          git config user.name "${GITHUB_RUN_ID:-ci}/${GITHUB_JOB:-weblate}"
+          git config user.email "${GITHUB_REPOSITORY:-fdroid/fdroiddata}@f-droid.org"
+          git fetch https://hosted.weblate.org/git/f-droid/anti-features/
+          git checkout -B weblate FETCH_HEAD
+          export EXITVALUE=0
+          if ! git rebase "$(git rev-parse HEAD@{1} 2>/dev/null || git rev-parse HEAD)"; then
+              export EXITVALUE=1;
+              set -x;
+              while git rebase --skip; do echo; done;
+              set +x;
+          fi
+          git diff --exit-code
+          exit $EXITVALUE
+
+  # -------------------------------------------------------------------------
+  # check_git_repos
+  #
+  # The original only ran this on scheduled pipelines and when the
+  # CHECK_GIT_REPO variable was "true".
+  # -------------------------------------------------------------------------
+  check-git-repos:
+    if: >
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.check_git_repo)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eux
+          apt-get update
+          apt-get -qy install --no-install-recommends ca-certificates git python3-colorama python3-yaml
+
+      - name: Check git repo availability
+        shell: bash
+        run: |
+          set -eux
+          tools/check-git-repo-availability.py || export EXITVALUE=1
+          chown -R "$(whoami)" .
+          test -d public || mkdir public
+          cp $(git status | grep -Eo 'metadata/.*\.yml') public/ || true
+          exit ${EXITVALUE:-0}
+
+      - name: Upload rewritten metadata on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-git-repos-public
+          path: public
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # -------------------------------------------------------------------------
+  # checkupdates_filter
+  #
+  # checkupdates should only be allowed to modify app metadata files, e.g.
+  # metadata/*.yml.  Anything else should throw an error here.  The original
+  # only ran this for the checkupdates-bot repository.
+  # -------------------------------------------------------------------------
+  checkupdates-filter:
+    if: github.repository == 'fdroid/checkupdates-bot-fdroiddata'
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eux
+          apt-get update
+          apt-get -qy install --no-install-recommends ca-certificates git
+
+      - name: Ensure only metadata files changed
+        shell: bash
+        run: |
+          set -eux
+          chown -R "$(whoami)" .
+          git fetch https://gitlab.com/fdroid/fdroiddata.git
+          if git diff --merge-base FETCH_HEAD HEAD --name-only | grep -v '^metadata/\S*\.yml$'; then
+              printf "\x1b[31mERROR Modifications to paths checkupdates-bot is not allowed to change! \x1b[0m\n"
+              exit 1
+          else
+              echo "All file modifications match paths checkupdates-bot is allowed to change."
+          fi

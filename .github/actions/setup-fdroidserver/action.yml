@@ -1,0 +1,45 @@
+name: 'Setup fdroidserver'
+description: >-
+  Clone fdroidserver from source (master) into a directory and export the env
+  vars needed by the fdroiddata test scripts.  This mirrors the
+  `.install_fdroid_server` anchor in the original .gitlab-ci.yml.
+
+inputs:
+  directory:
+    description: 'Where to unpack fdroidserver, relative to the workspace.'
+    required: false
+    default: 'fdroidserver'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Download and unpack fdroidserver
+      shell: bash
+      env:
+        FDS_DIR: ${{ inputs.directory }}
+      run: |
+        set -euxo pipefail
+        # only relevant for the version check below, but harmless
+        git ls-remote https://gitlab.com/fdroid/fdroidserver.git master
+        rm -rf "$FDS_DIR"
+        mkdir -p "$FDS_DIR"
+        curl --silent --location \
+          https://gitlab.com/fdroid/fdroidserver/-/archive/master/fdroidserver-master.tar.gz \
+          | tar -xz --directory="$FDS_DIR" --strip-components=1
+
+    - name: Export env vars for later steps
+      shell: bash
+      env:
+        FDS_DIR: ${{ inputs.directory }}
+      run: |
+        set -euxo pipefail
+        # Persist to $GITHUB_ENV so subsequent steps in the job see them.
+        # PATH needs to be absolute here.
+        echo "$PWD/$FDS_DIR" >> "$GITHUB_PATH"
+        {
+          echo "fdroidserver=$PWD/$FDS_DIR"
+          echo "PYTHONPATH=$PWD/$FDS_DIR:$PWD/$FDS_DIR/examples"
+          echo "PYTHONUNBUFFERED=true"
+          # avoid error from the env var in config.yml
+          echo "serverwebroot=/tmp"
+        } >> "$GITHUB_ENV"

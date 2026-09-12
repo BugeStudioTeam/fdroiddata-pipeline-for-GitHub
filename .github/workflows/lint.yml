@@ -1,0 +1,171 @@
+name: lint
+
+# Port of the config/tooling linting jobs from the original .gitlab-ci.yml:
+#   fdroid lint config, tools check scripts, YAML 1.2
+#
+# These jobs only run when config files / CI files / the tools change, and
+# `fdroid lint config` was additionally restricted to the upstream repo.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - '.gitlab-ci.yml'
+      - '.github/**'
+      - 'config.yml'
+      - 'config/*.yml'
+      - 'config/*/*.yml'
+      - 'tools/**'
+  pull_request:
+    paths:
+      - '.gitlab-ci.yml'
+      - '.github/**'
+      - 'config.yml'
+      - 'config/*.yml'
+      - 'config/*/*.yml'
+      - 'tools/**'
+  workflow_dispatch:
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # fdroid lint config
+  # -------------------------------------------------------------------------
+  fdroid-lint-config:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eux
+          apt-get -qy update
+          apt-get -qy dist-upgrade
+          apt-get -qy install --no-install-recommends \
+              ca-certificates \
+              curl \
+              git \
+              python3-asn1crypto \
+              python3-defusedxml \
+              python3-git \
+              python3-pycountry \
+              python3-qrcode \
+              python3-requests \
+              python3-ruamel.yaml \
+              yamllint
+
+      - name: Install fdroidserver (source)
+        uses: ./.github/actions/setup-fdroidserver
+
+      - name: fdroid lint config
+        shell: bash
+        run: |
+          set -eux
+          chown -R "$(whoami)" .
+          chmod 0600 config.yml config/*.yml config/*/*.yml
+          export gpghome=foo keystore=foo keystorepass=foo keypass=foo serverwebconfig=foo
+          fdroid lint config.yml config/*.yml config/*/*.yml
+          # Alternate English locales must include the country code, e.g. en-GB.
+          python3 -c "import os; exit(os.path.exists('config/en/'))"
+
+  # -------------------------------------------------------------------------
+  # tools check scripts
+  # -------------------------------------------------------------------------
+  tools-check-scripts:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5000
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eux
+          apt-get -qy update
+          apt-get -qy dist-upgrade
+          apt-get -qy install --no-install-recommends exiftool git jq python3 python3-yaml
+
+      - name: Run tools check scripts
+        shell: bash
+        run: |
+          set -eux
+          # shellcheck disable=SC1091
+          source .github/scripts/ci-helpers.sh
+          export EXITVALUE=0
+          # shellcheck disable=SC2317
+          function set_error() { export EXITVALUE=1; printf "\x1b[31mERROR %s\x1b[0m\n" "$(history | tail -2 | head -1 | cut -b 6-500)"; }
+
+          chown -R "$(whoami)" .
+          ./tools/check-exif-in-images.sh || set_error
+          ./tools/check-localized-metadata.py || set_error
+          ./tools/check-keyalias-collision.py || set_error
+          ./tools/check-metadata-summary-whitespace.py || set_error
+          ./tools/check-for-unattached-signatures.py || set_error
+          ./tools/make-summary-translatable.py || set_error
+
+          # GitLab only supported one codequality report per job; here we merge
+          # them into a single JSON array like the original did.
+          if compgen -G '*.json' > /dev/null; then
+            jq '[.[]|.[]]' --slurp *.json > codequality.json
+          else
+            echo '[]' > codequality.json
+          fi
+
+          exit $EXITVALUE
+
+      - name: Upload codequality report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codequality-tools-check-scripts
+          path: codequality.json
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # YAML 1.2
+  #
+  # Roundtrip parsing to check whether config files are in the strictest
+  # subset of YAML 1.2 (the JSON Schema).  yq does not preserve blank
+  # lines/comments, so those are stripped before comparison.
+  # -------------------------------------------------------------------------
+  yaml-1-2:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install yq
+        shell: bash
+        run: |
+          set -eux
+          apt-get update
+          apt-get -qy install --no-install-recommends yq
+
+      - name: Check strict YAML 1.2 conformance
+        shell: bash
+        run: |
+          set -eux
+          for f in config.yml config/*.yml config/*/*.yml; do
+              echo $f
+              diff --unified --color \
+                <(sed -e 's,\s*#.*,,' -e '/^$/d' -e '/^---$/d' $f) \
+                <(yq --yaml-output-grammar-version 1.2 --yaml-roundtrip --width 512 . $f)
+          done
