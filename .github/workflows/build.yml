@@ -83,8 +83,28 @@ jobs:
           apt-get update
           apt-get dist-upgrade -y
 
-          # shellcheck disable=SC1091
-          test -n "$fdroidserver" || source /etc/profile.d/bsenv.sh
+          # The buildserver image ships /etc/profile.d/bsenv.sh, which defines
+          # $fdroidserver (among others).  GitLab sourced it via `before_script`
+          # with `test -n "$fdroidserver" || source /etc/profile.d/bsenv.sh`.
+          #
+          # Two things break that idiom on GitHub Actions:
+          #   1. steps run as `bash --noprofile --norc`, so bsenv.sh is not
+          #      auto-sourced the way a login shell would do it;
+          #   2. ci-helpers.sh above enables `set -u`, so merely *referencing*
+          #      an unset $fdroidserver aborts the step (this was the observed
+          #      "fdroidserver: unbound variable" failure).
+          #
+          # So: source bsenv.sh if it exists (it is the authoritative definition
+          # inside this image), then only fall back to the workspace checkout
+          # when the image provides nothing at all.  We never override a value
+          # that the buildserver image already set.
+          if [ -z "${fdroidserver:-}" ] && [ -f /etc/profile.d/bsenv.sh ]; then
+            # shellcheck disable=SC1091
+            source /etc/profile.d/bsenv.sh
+          fi
+          export fdroidserver="${fdroidserver:-$GITHUB_WORKSPACE/fdroidserver}"
+          export PYTHONPATH="$fdroidserver:$fdroidserver/examples"
+          export PATH="$fdroidserver:$PATH"
 
           # These packages are needed to make this env like the production buildserver.
           sdkmanager "platform-tools" "build-tools;31.0.0"
@@ -123,6 +143,19 @@ jobs:
           # for them to succeed.  Some runners do not support setting sysctl,
           # so it cannot be required.
           sysctl fs.inotify.max_user_watches=524288 || true
+
+          # Each GitHub Actions step is a *fresh* shell that does NOT inherit
+          # variables exported by earlier steps (unlike GitLab's before_script,
+          # which runs before every script block).  Since `source ci-helpers.sh`
+          # enables `set -u`, $fdroidserver must be (re)established here before
+          # the `export fdroid=...` line below expands it.
+          if [ -z "${fdroidserver:-}" ] && [ -f /etc/profile.d/bsenv.sh ]; then
+            # shellcheck disable=SC1091
+            source /etc/profile.d/bsenv.sh
+          fi
+          export fdroidserver="${fdroidserver:-$GITHUB_WORKSPACE/fdroidserver}"
+          export PYTHONPATH="$fdroidserver:$fdroidserver/examples"
+          export PATH="$fdroidserver:$PATH"
 
           export GRADLE_USER_HOME="$home_vagrant/.gradle"
           # each `fdroid build --on-server` run expects sudo, then uninstalls it

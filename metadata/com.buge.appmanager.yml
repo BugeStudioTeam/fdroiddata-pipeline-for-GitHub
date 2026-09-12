@@ -1,0 +1,29 @@
+Categories:
+  - App Manager
+License: GPL-3.0-only
+AuthorName: Buge Studio
+AuthorEmail: creepynightmares@proton.me
+AuthorWebSite: https://bugestudio.website
+WebSite: https://bugestudio.website/appmanager
+SourceCode: https://github.com/BugeStudioTeam/Buge-App-Manager
+IssueTracker: https://github.com/BugeStudioTeam/Buge-App-Manager/issues
+Changelog: https://github.com/BugeStudioTeam/Buge-App-Manager/releases
+Donate: https://bugestudio.website/support
+
+AutoName: Buge App Manager
+
+RepoType: git
+Repo: https://github.com/BugeStudioTeam/Buge-App-Manager.git
+
+Builds:
+  - versionName: 12.69.125
+    versionCode: 193
+    commit: 8427eb463e37bf1b228ae1e0d03f039ad1e05664
+    subdir: app
+    gradle:
+      - yes
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags ^AppManager(\d+\.\d+\.\d+)$
+CurrentVersion: 12.69.125
+CurrentVersionCode: 193
